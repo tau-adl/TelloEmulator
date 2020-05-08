@@ -3,6 +3,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace TelloEmulator
 {
@@ -57,8 +59,7 @@ namespace TelloEmulator
         private static object _flightDataTimeState;
         private static Timer _flightDataTimer;
         private static Timer _telemetryTimer;
-        private static IPEndPoint _telemetryRemoteEndPoint;
-        private static IPEndPoint _commandRemoteEndPoint;
+        private readonly static Dictionary<IPEndPoint, DateTime> _commandRemoteEndPoint = new Dictionary<IPEndPoint, DateTime>();
         private static ManualResetEvent _readyWaitHandle;
 
 
@@ -78,8 +79,6 @@ namespace TelloEmulator
             _velocity = new Vector3D();
             _position = new Vector3D();
             _mpry = new Vector3D();
-            _telemetryRemoteEndPoint = null;
-            _commandRemoteEndPoint = null;
             if (_telemetryTimer != null)
             {
                 _telemetryTimer.Change(Timeout.Infinite, Timeout.Infinite);
@@ -314,12 +313,14 @@ namespace TelloEmulator
                 _readyWaitHandle.Set();
                 while (true)
                 {
-                    EndPoint remoteEndPoint = _commandRemoteEndPoint ?? new IPEndPoint(IPAddress.Any, 0);
+                    EndPoint remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
                     var count = socket.ReceiveFrom(buffer, SocketFlags.None, ref remoteEndPoint);
                     if (count == 0)
                         return;
                     var command = Encoding.ASCII.GetString(buffer, 0, count);
                     var response = ProcessCommand(command);
+
+                    Console.WriteLine($"Remote Command: {command}, Response: {response}");
                     if (response != null)
                     {
                         socket.SendTo(Encoding.ASCII.GetBytes(response), remoteEndPoint);
@@ -328,15 +329,23 @@ namespace TelloEmulator
                         {
                             if (command == "command")
                             {
-                                if (_commandRemoteEndPoint == null)
+                                var remoteIPEndPoint = (IPEndPoint)remoteEndPoint;
+                                lock (_commandRemoteEndPoint)
                                 {
-                                    Console.WriteLine($"INFO: Command channel established with {remoteEndPoint}");
-                                    _commandRemoteEndPoint = (IPEndPoint) remoteEndPoint;
-                                    _telemetryRemoteEndPoint = new IPEndPoint(_commandRemoteEndPoint.Address, 8890);
-                                    Interlocked.MemoryBarrier();
-                                    Console.WriteLine($"INFO: Starting telemetry transmission to {_telemetryRemoteEndPoint} every 10Hz");
-                                    _telemetryTimer = new Timer(TelemetryTimerWork, socket, 0, 100);
-                                    Console.WriteLine(TelloPrompt);
+                                    if (!_commandRemoteEndPoint.ContainsKey(remoteIPEndPoint))
+                                    {
+                                        Console.WriteLine($"INFO: Command channel established with {remoteEndPoint}");
+                                        _commandRemoteEndPoint[remoteIPEndPoint] = DateTime.Now;
+                                        Interlocked.MemoryBarrier();
+                                        Console.WriteLine($"INFO: Starting telemetry transmission to {remoteIPEndPoint.Address} every 10Hz");
+                                        if (_telemetryTimer == null)
+                                            _telemetryTimer = new Timer(TelemetryTimerWork, socket, 0, 100);
+                                        Console.WriteLine(TelloPrompt);
+                                    }
+                                    else
+                                    {
+                                        _commandRemoteEndPoint[(IPEndPoint)remoteEndPoint] = DateTime.Now;
+                                    }
                                 }
                             }
                             else if (command.StartsWith("wifi "))
@@ -363,15 +372,42 @@ namespace TelloEmulator
 
         private static void TelemetryTimerWork(object state)
         {
-            var telemetryEndPoint = _telemetryRemoteEndPoint;
             var socket = (Socket) state;
-            if (telemetryEndPoint == null)
-                return;
             try
             {
+                KeyValuePair<IPEndPoint, DateTime>[] remoteEndPoints;
+                lock (_commandRemoteEndPoint)
+                {
+                    remoteEndPoints = _commandRemoteEndPoint.ToArray();
+                }
                 var telemetry = $"mid:{_mid};x:{_position.X:F0};y:{_position.Y:F0};z:{_position.Z:F0};mpry:{_mpry.X:F0},{_mpry.Y:F0},{_mpry.Z:F0};pitch:{_pitch};roll:{_roll};yaw:{_yaw};vgx:{_velocity.X:F0};vgy:{_velocity.Y:F0};vgz:{_velocity.Z:F0};templ:{_tempLow};temph:{_tempHigh};tof:{_tof};h:{_height/10};bat:{_battery};baro:{_barometer:0.00####};time:{_flightTime};agx:{_acceleration.X:F2};agy:{_acceleration.Y:F2};agz:{_acceleration.Z:F2};";
                 var bytes = Encoding.ASCII.GetBytes(telemetry);
-                socket.SendTo(bytes, telemetryEndPoint);
+                var garbage = new List<IPEndPoint>();
+                foreach (var pair in remoteEndPoints)
+                {
+                    var lastCommand = DateTime.Now - pair.Value;
+                    if (lastCommand.TotalSeconds > 60)
+                    {
+                        garbage.Add(pair.Key);
+                        continue;
+                    }
+                    try
+                    {
+                        socket.SendTo(bytes, pair.Key);
+                    }
+                    catch (SocketException)
+                    {
+                        garbage.Add(pair.Key);
+                    }
+                }
+                if (garbage.Count > 0)
+                {
+                    lock (_commandRemoteEndPoint)
+                    {
+                        foreach (var key in garbage)
+                            _commandRemoteEndPoint.Remove(key);
+                    }
+                }
             }
             catch (SocketException sex)
             {
